@@ -3,7 +3,7 @@
 """
 INMAC · Motor universal de fichajes para planillas base TORNU / Hemoterapia / Cubiertas.
 
-Versión v3:
+Versión v4 corregida:
 - Detecta planilla base y archivo de fichajes sin depender del nombre.
 - Detecta el mes desde el archivo Original del fichero.
 - Reubica las fórmulas diarias usando las fórmulas originales de la plantilla base:
@@ -13,7 +13,10 @@ Versión v3:
 - Carga entradas y salidas como horas reales de Excel.
 - Marca AUSENTE en días laborables sin fichada.
 - Actualiza fórmulas de resumen: AUSENCIA, ENFERMEDAD, VIANDA, ART, FERIADO, VACACIONES.
-- No modifica datos manuales salvo celdas de carga diaria y fórmulas de resumen.
+- Fuerza formato numérico entero en todos los resúmenes para evitar valores visibles como 288:00:00.
+- Resalta el nombre con escala de rojos según días AUSENTE.
+- Resalta el legajo en amarillo cuando el vínculo nombre/legajo requiere revisión.
+- No modifica datos manuales salvo celdas de carga diaria, fórmulas de resumen y alertas visuales.
 """
 
 from __future__ import annotations
@@ -40,6 +43,17 @@ PAIS_FERIADOS = "AR"
 SUBDIV_FERIADOS = None
 UMBRAL_NOMBRE = 0.86
 UMBRAL_NOMBRE_SIMILAR = 0.90
+UMBRAL_ALERTA_IGNORADO = 0.70
+
+# Escala de rojo por cantidad de días AUSENTE.
+# 0-2: sin color; 3-4: muy suave; 5-7: suave; 8-10: medio; 11+: fuerte.
+ESCALA_ROJO_AUSENCIAS = [
+    (11, "E06666", "ROJO FUERTE"),
+    (8, "EA9999", "ROJO MEDIO"),
+    (5, "F4CCCC", "ROJO SUAVE"),
+    (3, "FCE8E6", "ROJO MUY SUAVE"),
+]
+FILL_LEGAJO_DUDOSO = PatternFill("solid", fgColor="FFF2CC")
 
 CORRECCIONES_NOMBRE = {
     "surez": "suarez",
@@ -59,6 +73,7 @@ HOJAS_AUXILIARES = [
     "VINCULOS_CARGADOS",
     "IGNORADOS_FICHADOR",
     "DIAGNOSTICO",
+    "ALERTAS_PROCESO",
 ]
 
 
@@ -430,6 +445,10 @@ def _insert_after(ws, col, header):
     _copiar_estilo_columna(ws, col, col + 1)
     ws.cell(1, col + 1).value = header
     ws.cell(2, col + 1).value = None
+    # Las columnas de resumen representan cantidades, no horas de reloj.
+    # Se fuerza formato entero para evitar visualizaciones como 288:00:00.
+    for r in range(3, ws.max_row + 1):
+        ws.cell(r, col + 1).number_format = "0"
     return col + 1
 
 
@@ -574,6 +593,21 @@ def formula_feriado(dias: list[tuple[date, dict]], feriados: dict) -> str:
     return f"={total}"
 
 
+def _forzar_formato_numerico_resumen(ws, personas, resumen):
+    """Impide que los resultados de resumen hereden formatos de fecha/hora.
+
+    Las fórmulas devuelven cantidades enteras de horas o días. Si una plantilla
+    trae accidentalmente un formato [h]:mm:ss, Excel puede mostrar 12 como
+    288:00:00. Por eso todas las celdas de resumen se normalizan a entero.
+    """
+    grupos = [resumen["totales"], resumen["q1"], resumen["q2"]]
+    for p in personas:
+        fila = p["fila"]
+        for grupo in grupos:
+            for col in set(grupo.values()):
+                ws.cell(fila, col).number_format = "0"
+
+
 def actualizar_resumenes(ws, personas, bloques, anio, mes, feriados):
     asegurar_columnas_resumen(ws)
     dias_mes = calendar.monthrange(anio, mes)[1]
@@ -613,6 +647,9 @@ def actualizar_resumenes(ws, personas, bloques, anio, mes, feriados):
         ws.cell(fila, t["horas"]).value = f"={get_column_letter(q1['horas'])}{fila}+{get_column_letter(q2['horas'])}{fila}"
         ws.cell(fila, t["50"]).value = f"={get_column_letter(q1['50'])}{fila}+{get_column_letter(q2['50'])}{fila}"
         ws.cell(fila, t["100"]).value = f"={get_column_letter(q1['100'])}{fila}+{get_column_letter(q2['100'])}{fila}"
+
+    _forzar_formato_numerico_resumen(ws, personas, resumen)
+    return resumen
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +724,130 @@ def vincular_personas(personas: list[dict], registros: list[dict]):
         })
 
     return vinculos, cargados, ignorados
+
+
+def _color_rojo_ausencias(cantidad: int):
+    for minimo, color, etiqueta in ESCALA_ROJO_AUSENCIAS:
+        if cantidad >= minimo:
+            return PatternFill("solid", fgColor=color), etiqueta
+    return None, None
+
+
+def _motivos_vinculo_dudoso(personas, cargados, ignorados):
+    """Devuelve motivos de revisión por fila de persona.
+
+    Un vínculo se considera revisable cuando el método no fue legajo+nombre,
+    el puntaje es parcial, el legajo del fichador no coincide, el legajo está
+    repetido en la planilla o un fichaje ignorado tiene un candidato cercano.
+    """
+    motivos = defaultdict(list)
+    cantidad_legajos = defaultdict(int)
+    persona_por_legajo = defaultdict(list)
+    persona_por_clave = defaultdict(list)
+
+    for p in personas:
+        if p.get("legajo"):
+            cantidad_legajos[p["legajo"]] += 1
+            persona_por_legajo[p["legajo"]].append(p)
+        persona_por_clave[clave_nombre(p["nombre"])].append(p)
+
+    for item in cargados:
+        fila = item.get("FILA")
+        if not fila:
+            continue
+        metodo = str(item.get("METODO") or "").strip().lower()
+        try:
+            puntaje = float(item.get("PUNTAJE") or 0)
+        except Exception:
+            puntaje = 0.0
+        leg_fichador = normalizar_legajo(item.get("LEG_FICHADOR"))
+        leg_planilla = normalizar_legajo(item.get("LEG_PLANILLA"))
+
+        if metodo != "legajo+nombre":
+            motivos[fila].append(f"Método de vínculo: {item.get('METODO')}")
+        if puntaje < 0.999:
+            motivos[fila].append(f"Nombre no idéntico; puntaje {puntaje:.3f}")
+        if leg_fichador and leg_planilla and leg_fichador != leg_planilla:
+            motivos[fila].append(f"Legajo fichador {leg_fichador} distinto de planilla {leg_planilla}")
+        if leg_planilla and cantidad_legajos.get(leg_planilla, 0) > 1:
+            motivos[fila].append(f"Legajo {leg_planilla} repetido en la planilla")
+
+    # También señalar posibles personas omitidas por un match no aceptado pero cercano.
+    for item in ignorados:
+        try:
+            puntaje = float(item.get("PUNTAJE") or 0)
+        except Exception:
+            puntaje = 0.0
+        if puntaje < UMBRAL_ALERTA_IGNORADO:
+            continue
+
+        candidatos = []
+        leg_candidato = normalizar_legajo(item.get("LEG_CANDIDATO"))
+        if leg_candidato:
+            candidatos = persona_por_legajo.get(leg_candidato, [])
+        if not candidatos:
+            candidatos = persona_por_clave.get(clave_nombre(item.get("MEJOR_CANDIDATO")), [])
+
+        if len(candidatos) == 1:
+            p = candidatos[0]
+            motivos[p["fila"]].append(
+                f"Fichaje ignorado cercano: {item.get('NOMBRE_FICHADOR')} "
+                f"(puntaje {puntaje:.3f})"
+            )
+
+    # Quitar motivos repetidos conservando orden.
+    return {
+        fila: list(dict.fromkeys(lista))
+        for fila, lista in motivos.items()
+        if lista
+    }
+
+
+def aplicar_alertas_visuales(ws, personas, bloques, anio, mes, max_fecha, feriados, cols, cargados, ignorados):
+    """Pinta únicamente E (nombre) en rojo y D/LEG en amarillo."""
+    alertas = []
+    motivos_por_fila = _motivos_vinculo_dudoso(personas, cargados, ignorados)
+    dias_mes = calendar.monthrange(anio, mes)[1]
+
+    for p in personas:
+        fila = p["fila"]
+        faltas = []
+        for dia in range(1, min(dias_mes, len(bloques)) + 1):
+            fecha = date(anio, mes, dia)
+            if fecha > max_fecha or fecha.weekday() == 6 or fecha in feriados:
+                continue
+            bloque = bloques[dia - 1]
+            estado = str(ws.cell(fila, bloque["ausente"]).value or "").strip().upper()
+            if estado == "AUSENTE":
+                faltas.append(fecha)
+
+        fill_rojo, nivel = _color_rojo_ausencias(len(faltas))
+        if fill_rojo is not None:
+            ws.cell(fila, cols["col_nombre"]).fill = copy.copy(fill_rojo)
+            alertas.append({
+                "TIPO": "AUSENCIAS",
+                "COLOR": nivel,
+                "FILA": fila,
+                "LEG": p.get("legajo"),
+                "PERSONA": p.get("nombre"),
+                "CANTIDAD": len(faltas),
+                "DETALLE": ", ".join(f.strftime("%d/%m/%Y") for f in faltas),
+            })
+
+        motivos = motivos_por_fila.get(fila, [])
+        if motivos:
+            ws.cell(fila, cols["col_legajo"]).fill = copy.copy(FILL_LEGAJO_DUDOSO)
+            alertas.append({
+                "TIPO": "REVISAR VÍNCULO",
+                "COLOR": "AMARILLO",
+                "FILA": fila,
+                "LEG": p.get("legajo"),
+                "PERSONA": p.get("nombre"),
+                "CANTIDAD": len(motivos),
+                "DETALLE": " | ".join(motivos),
+            })
+
+    return alertas
 
 
 def agrupar_marcas(registros, vinculos):
@@ -864,8 +1025,13 @@ def procesar_archivos(archivo_planilla, archivo_fichajes, descargar_en_colab=Fal
     # Resúmenes de horas y nuevos estados.
     actualizar_resumenes(ws, personas, bloques, anio, mes, feriados)
 
+    alertas = aplicar_alertas_visuales(
+        ws, personas, bloques, anio, mes, max_fecha, feriados, cols, cargados, ignorados
+    )
+
     agregar_hoja_control(wb, "VINCULOS_CARGADOS", cargados)
     agregar_hoja_control(wb, "IGNORADOS_FICHADOR", ignorados)
+    agregar_hoja_control(wb, "ALERTAS_PROCESO", alertas)
     agregar_hoja_control(wb, "DIAGNOSTICO", [{
         "PLANILLA": Path(archivo_planilla).name,
         "FICHAJES": Path(archivo_fichajes).name,
@@ -875,6 +1041,8 @@ def procesar_archivos(archivo_planilla, archivo_fichajes, descargar_en_colab=Fal
         "PERSONAS_PLANILLA": len(personas),
         "IDENTIDADES_VINCULADAS": len(cargados),
         "IDENTIDADES_IGNORADAS": len(ignorados),
+        "NOMBRES_RESALTADOS_ROJO": sum(1 for a in alertas if a.get("TIPO") == "AUSENCIAS"),
+        "LEGAJOS_RESALTADOS_AMARILLO": sum(1 for a in alertas if a.get("TIPO") == "REVISAR VÍNCULO"),
         "FERIADOS_DETECTADOS": "; ".join(f"{d.strftime('%d/%m/%Y')} {feriados[d]}" for d in sorted(feriados)),
     }])
 
