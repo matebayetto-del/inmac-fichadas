@@ -10,7 +10,7 @@ from contextlib import contextmanager
 
 import streamlit as st
 
-import planilla_fichajes_inmac_v4_corregido as motor
+import planilla_fichajes_inmac_v3 as motor
 
 st.set_page_config(
     page_title="INMAC | Planilla de fichajes",
