@@ -10,7 +10,7 @@ from contextlib import contextmanager
 
 import streamlit as st
 
-import planilla_fichajes_inmac_v3 as motor
+import planilla_fichajes_inmac_v4_corregido as motor
 
 st.set_page_config(
     page_title="INMAC | Planilla de fichajes",
@@ -150,7 +150,7 @@ if procesar:
                 st.write(
                     "Reubica fórmulas diarias según día real, conserva la lógica de la plantilla, "
                     "calcula ausencias/enfermedad/ART/vacaciones con 8 h en semana y 4 h en sábado, "
-                    "suma vianda por presencia y feriados según calendario argentino."
+                    "suma vianda por presencia y feriados según calendario argentino. Además, corrige el formato numérico de los resúmenes, marca nombres en escala de rojo según faltas y legajos en amarillo cuando el vínculo requiere revisión."
                 )
     except Exception as e:
         st.error(f"No se pudo completar el proceso: {e}")
