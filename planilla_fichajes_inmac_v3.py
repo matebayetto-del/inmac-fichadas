@@ -135,7 +135,7 @@ def derivar_legajo_desde_id(valor) -> str | None:
 # ---------------------------------------------------------------------------
 
 def leer_fichajes(path: str | Path) -> list[dict]:
-    libro = xlrd.open_workbook(str(path))
+    libro = xlrd.open_workbook(str(path), ignore_workbook_corruption=True)
     hoja = libro.sheet_by_name("Original") if "Original" in libro.sheet_names() else libro.sheet_by_index(0)
 
     headers = {}
