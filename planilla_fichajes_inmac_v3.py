@@ -1,9 +1,8 @@
-
 # -*- coding: utf-8 -*-
 """
 INMAC · Motor universal de fichajes para planillas base TORNU / Hemoterapia / Cubiertas.
 
-Versión v4 final:
+Versión v3:
 - Detecta planilla base y archivo de fichajes sin depender del nombre.
 - Detecta el mes desde el archivo Original del fichero.
 - Reubica las fórmulas diarias usando las fórmulas originales de la plantilla base:
@@ -13,10 +12,7 @@ Versión v4 final:
 - Carga entradas y salidas como horas reales de Excel.
 - Marca AUSENTE en días laborables sin fichada.
 - Actualiza fórmulas de resumen: AUSENCIA, ENFERMEDAD, VIANDA, ART, FERIADO, VACACIONES.
-- Corrige el formato visual de todas las celdas de resumen para mostrar enteros en negro.
-- Resalta nombres en escala roja según faltas y legajos en amarillo cuando el vínculo es dudoso.
-- Limpia alertas anteriores antes de recalcularlas.
-- No modifica datos manuales salvo celdas de carga diaria, fórmulas de resumen y alertas visuales.
+- No modifica datos manuales salvo celdas de carga diaria y fórmulas de resumen.
 """
 
 from __future__ import annotations
@@ -44,20 +40,6 @@ SUBDIV_FERIADOS = None
 UMBRAL_NOMBRE = 0.86
 UMBRAL_NOMBRE_SIMILAR = 0.90
 
-# Alertas visuales.
-UMBRAL_FALTAS_ROJO = 3
-UMBRAL_IGNORADO_CERCANO = 0.70
-
-ESCALA_ROJO_FALTAS = [
-    (11, "E06666", "ROJO FUERTE"),
-    (8, "EA9999", "ROJO MEDIO"),
-    (5, "F4CCCC", "ROJO SUAVE"),
-    (3, "FCE8E6", "ROJO MUY SUAVE"),
-]
-
-COLOR_AMARILLO_DUDOSO = "FFF2CC"
-COLOR_TEXTO_RESUMEN = "000000"
-
 CORRECCIONES_NOMBRE = {
     "surez": "suarez",
     "suárez": "suarez",
@@ -76,7 +58,6 @@ HOJAS_AUXILIARES = [
     "VINCULOS_CARGADOS",
     "IGNORADOS_FICHADOR",
     "DIAGNOSTICO",
-    "ALERTAS_PROCESO",
 ]
 
 
@@ -632,204 +613,6 @@ def actualizar_resumenes(ws, personas, bloques, anio, mes, feriados):
         ws.cell(fila, t["50"]).value = f"={get_column_letter(q1['50'])}{fila}+{get_column_letter(q2['50'])}{fila}"
         ws.cell(fila, t["100"]).value = f"={get_column_letter(q1['100'])}{fila}+{get_column_letter(q2['100'])}{fila}"
 
-    # Corregir formato y color de fuente en todas las celdas numéricas del resumen.
-    normalizar_formato_resumen(ws, personas, resumen)
-    return resumen
-
-
-# ---------------------------------------------------------------------------
-# Normalización visual de resúmenes y alertas
-# ---------------------------------------------------------------------------
-
-def _poner_texto_negro(celda):
-    """Conserva tipografía/tamaño, pero fuerza el color negro."""
-    fuente = copy.copy(celda.font)
-    fuente.color = COLOR_TEXTO_RESUMEN
-    celda.font = fuente
-
-
-def normalizar_formato_resumen(ws, personas, resumen):
-    """Evita resultados invisibles o mostrados como horas.
-
-    Las columnas insertadas pueden heredar:
-    - formatos de hora como [h]:mm:ss;
-    - colores de fuente iguales al fondo;
-    - formatos personalizados que ocultan el cero.
-
-    Todas las celdas numéricas de resumen se fijan como enteros visibles.
-    """
-    columnas = set()
-
-    for zona in ("totales", "q1", "q2"):
-        for clave, columna in resumen[zona].items():
-            if isinstance(columna, int):
-                columnas.add(columna)
-
-    for persona in personas:
-        fila = persona["fila"]
-        for columna in columnas:
-            celda = ws.cell(fila, columna)
-            celda.number_format = "0"
-            _poner_texto_negro(celda)
-
-
-def _fill_rojo_faltas(cantidad):
-    for minimo, color, etiqueta in ESCALA_ROJO_FALTAS:
-        if cantidad >= minimo:
-            return PatternFill("solid", fgColor=color), etiqueta
-    return None, None
-
-
-def _limpiar_colores_alerta(ws, personas, cols):
-    """Borra alertas de ejecuciones anteriores únicamente en LEG y NOMBRE."""
-    sin_relleno = PatternFill(fill_type=None)
-    for persona in personas:
-        fila = persona["fila"]
-        ws.cell(fila, cols["col_legajo"]).fill = copy.copy(sin_relleno)
-        ws.cell(fila, cols["col_nombre"]).fill = copy.copy(sin_relleno)
-
-
-def _razones_vinculo_dudoso(personas, cargados, ignorados):
-    """Devuelve motivos de revisión agrupados por fila de la planilla."""
-    razones = defaultdict(list)
-
-    cantidad_por_legajo = defaultdict(int)
-    persona_por_legajo = defaultdict(list)
-    persona_por_nombre = defaultdict(list)
-
-    for persona in personas:
-        legajo = normalizar_legajo(persona.get("legajo"))
-        if legajo:
-            cantidad_por_legajo[legajo] += 1
-            persona_por_legajo[legajo].append(persona)
-        persona_por_nombre[clave_nombre(persona.get("nombre"))].append(persona)
-
-    for item in cargados:
-        fila = item.get("FILA")
-        if not fila:
-            continue
-
-        metodo = str(item.get("METODO") or "").strip().lower()
-        try:
-            puntaje = float(item.get("PUNTAJE") or 0)
-        except Exception:
-            puntaje = 0.0
-
-        leg_fichador = normalizar_legajo(item.get("LEG_FICHADOR"))
-        leg_planilla = normalizar_legajo(item.get("LEG_PLANILLA"))
-
-        if metodo != "legajo+nombre":
-            razones[fila].append(f"Método de vínculo: {item.get('METODO')}")
-        if puntaje < 0.999:
-            razones[fila].append(f"Coincidencia de nombre parcial ({puntaje:.3f})")
-        if leg_fichador and leg_planilla and leg_fichador != leg_planilla:
-            razones[fila].append(
-                f"Legajo fichador {leg_fichador} distinto de planilla {leg_planilla}"
-            )
-        if leg_planilla and cantidad_por_legajo.get(leg_planilla, 0) > 1:
-            razones[fila].append(f"Legajo {leg_planilla} repetido en la planilla")
-
-    # También advertir cuando un fichaje ignorado quedó cerca de una persona.
-    for item in ignorados:
-        try:
-            puntaje = float(item.get("PUNTAJE") or 0)
-        except Exception:
-            puntaje = 0.0
-
-        if puntaje < UMBRAL_IGNORADO_CERCANO:
-            continue
-
-        leg_candidato = normalizar_legajo(item.get("LEG_CANDIDATO"))
-        candidatos = persona_por_legajo.get(leg_candidato, []) if leg_candidato else []
-
-        if not candidatos:
-            candidatos = persona_por_nombre.get(
-                clave_nombre(item.get("MEJOR_CANDIDATO")),
-                [],
-            )
-
-        if len(candidatos) == 1:
-            persona = candidatos[0]
-            razones[persona["fila"]].append(
-                f"Fichaje ignorado cercano: {item.get('NOMBRE_FICHADOR')} "
-                f"({puntaje:.3f})"
-            )
-
-    # Eliminar razones repetidas manteniendo orden.
-    return {
-        fila: list(dict.fromkeys(motivos))
-        for fila, motivos in razones.items()
-    }
-
-
-def aplicar_alertas_visuales(
-    ws,
-    personas,
-    bloques,
-    cols,
-    anio,
-    mes,
-    max_fecha,
-    cargados,
-    ignorados,
-):
-    """Colorea únicamente:
-    - NOMBRE: escala roja según cantidad de días AUSENTE.
-    - LEG: amarillo si el emparejamiento requiere revisión.
-    """
-    _limpiar_colores_alerta(ws, personas, cols)
-    razones_dudosas = _razones_vinculo_dudoso(personas, cargados, ignorados)
-    alertas = []
-
-    dias_mes = calendar.monthrange(anio, mes)[1]
-
-    for persona in personas:
-        fila = persona["fila"]
-        fechas_ausente = []
-
-        for dia in range(1, min(dias_mes, len(bloques)) + 1):
-            fecha = date(anio, mes, dia)
-            if fecha > max_fecha:
-                continue
-            bloque = bloques[dia - 1]
-            estado = str(ws.cell(fila, bloque["ausente"]).value or "").strip().upper()
-            if estado == "AUSENTE":
-                fechas_ausente.append(fecha)
-
-        relleno_rojo, nivel = _fill_rojo_faltas(len(fechas_ausente))
-        if relleno_rojo is not None:
-            ws.cell(fila, cols["col_nombre"]).fill = copy.copy(relleno_rojo)
-            alertas.append({
-                "TIPO": "AUSENCIAS",
-                "COLOR": nivel,
-                "FILA": fila,
-                "LEG": persona.get("legajo"),
-                "PERSONA": persona.get("nombre"),
-                "CANTIDAD": len(fechas_ausente),
-                "DETALLE": ", ".join(
-                    fecha.strftime("%d/%m/%Y") for fecha in fechas_ausente
-                ),
-                "CRITERIO": f"{len(fechas_ausente)} días marcados AUSENTE",
-            })
-
-        motivos = razones_dudosas.get(fila, [])
-        if motivos:
-            ws.cell(fila, cols["col_legajo"]).fill = PatternFill(
-                "solid",
-                fgColor=COLOR_AMARILLO_DUDOSO,
-            )
-            alertas.append({
-                "TIPO": "REVISAR VÍNCULO",
-                "COLOR": "AMARILLO",
-                "FILA": fila,
-                "LEG": persona.get("legajo"),
-                "PERSONA": persona.get("nombre"),
-                "CANTIDAD": len(motivos),
-                "DETALLE": " | ".join(motivos),
-                "CRITERIO": "Posible confusión de nombre o legajo",
-            })
-
-    return alertas
 
 # ---------------------------------------------------------------------------
 # Matching y carga
@@ -945,59 +728,141 @@ def agregar_hoja_control(wb, nombre, rows: list[dict]):
 # ---------------------------------------------------------------------------
 
 def score_planilla(path: str | Path) -> int:
+    """Puntúa una planilla base de forma tolerante.
+
+    Se revisan más filas/hojas que antes porque algunas plantillas pueden tener
+    encabezados desplazados o cambios de formato sin dejar de ser válidas.
+    """
     if Path(path).suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
         return 0
+
     score = 0
     try:
         wb = load_workbook(path, read_only=True, data_only=False)
-        for ws in wb.worksheets[:3]:
+        for ws in wb.worksheets[:5]:
             texto = []
-            for r in range(1, min(ws.max_row, 5) + 1):
-                for c in range(1, min(ws.max_column, 260) + 1):
+            for r in range(1, min(ws.max_row, 10) + 1):
+                for c in range(1, min(ws.max_column, 280) + 1):
                     texto.append(str(ws.cell(r, c).value or ""))
+
             flat = normalizar_texto(" ".join(texto))
-            if "apellido y nombre" in flat:
+            if "apellido y nombre" in flat or "nombre y apellido" in flat:
                 score += 4
-            if "entrada" in flat and "salida" in flat and "ausente" in flat:
-                score += 4
-            if "horas primera quincena" in flat:
+            if "entrada" in flat and "salida" in flat:
+                score += 3
+            if "ausente" in flat:
+                score += 2
+            if "horas primera quincena" in flat or "horas segunda quincena" in flat:
                 score += 2
         wb.close()
     except Exception:
         return 0
+
     return score
 
 
+def _fila_headers_fichajes(sh, max_filas=10):
+    """Busca la fila real de encabezados del fichero.
+
+    Antes solo se revisaba la fila 0 de la primera hoja. Eso puede fallar si el
+    XLS exportado agrega una hoja auxiliar o mueve los encabezados.
+    """
+    limite = min(sh.nrows, max_filas)
+    for r in range(limite):
+        headers = [normalizar_header(sh.cell_value(r, c)) for c in range(sh.ncols)]
+        unidos = " ".join(headers)
+        tiene_id = any(h == "id" or h.startswith("id ") for h in headers)
+        tiene_nombre = any("nombre" in h for h in headers)
+        tiene_hora = any("hora" in h or "fecha" in h for h in headers)
+        if tiene_id and tiene_nombre and tiene_hora:
+            return r, unidos
+    return None, ""
+
+
 def score_fichajes(path: str | Path) -> int:
+    """Puntúa el Original del fichador buscando todas las hojas del XLS.
+
+    Se prioriza una hoja llamada 'Original', pero si no existe se inspeccionan
+    todas las hojas.
+    """
     if Path(path).suffix.lower() != ".xls":
         return 0
+
     try:
         libro = xlrd.open_workbook(str(path))
-        sh = libro.sheet_by_index(0)
-        headers = " ".join(normalizar_header(sh.cell_value(0, c)) for c in range(sh.ncols))
-        if "id" in headers and "nombre" in headers and "hora" in headers:
-            return 10
+        nombres = libro.sheet_names()
+
+        orden = []
+        for nombre in nombres:
+            if normalizar_texto(nombre) == "original":
+                orden.append(nombre)
+        for nombre in nombres:
+            if nombre not in orden:
+                orden.append(nombre)
+
+        for nombre in orden:
+            sh = libro.sheet_by_name(nombre)
+            fila_header, _ = _fila_headers_fichajes(sh)
+            if fila_header is not None:
+                return 10
     except Exception:
         return 0
+
     return 0
 
 
 def detectar_archivos(archivos):
-    diag = []
+    """Detecta planilla y fichero con fallback seguro por extensión.
+
+    En este flujo INMAC el fichero exportado es .xls y la planilla base es
+    .xlsx/.xlsm. Si hay exactamente uno de cada tipo, se usan directamente,
+    evitando falsos negativos del detector por cambios menores en el archivo.
+    """
+    validos = []
     for p in archivos:
-        if Path(p).suffix.lower() not in {".xls", ".xlsx", ".xlsm", ".xltx", ".xltm"}:
-            continue
+        ext = Path(p).suffix.lower()
+        if ext in {".xls", ".xlsx", ".xlsm", ".xltx", ".xltm"}:
+            validos.append(str(p))
+
+    if len(validos) < 2:
+        raise ValueError("Subí al menos una planilla base y un archivo de fichajes.")
+
+    diag = []
+    for p in validos:
         diag.append({
             "path": str(p),
             "score_planilla": score_planilla(p),
             "score_fichajes": score_fichajes(p),
         })
-    if len(diag) < 2:
-        raise ValueError("Subí al menos una planilla base y un archivo de fichajes.")
+
+    # Fallback principal y más robusto para el flujo real de la app.
+    xls = [p for p in validos if Path(p).suffix.lower() == ".xls"]
+    modernas = [
+        p for p in validos
+        if Path(p).suffix.lower() in {".xlsx", ".xlsm", ".xltx", ".xltm"}
+    ]
+
+    if len(xls) == 1 and len(modernas) == 1:
+        return modernas[0], xls[0], diag
+
+    # Si se subieron más archivos, usar puntuación.
     planilla = max(diag, key=lambda x: x["score_planilla"])
     fichajes = max(diag, key=lambda x: x["score_fichajes"])
-    if planilla["score_planilla"] <= 0 or fichajes["score_fichajes"] <= 0 or planilla["path"] == fichajes["path"]:
-        raise ValueError("No pude detectar automáticamente planilla base y fichajes.")
+
+    if (
+        planilla["score_planilla"] <= 0
+        or fichajes["score_fichajes"] <= 0
+        or planilla["path"] == fichajes["path"]
+    ):
+        detalle = "; ".join(
+            f"{Path(d['path']).name}: planilla={d['score_planilla']}, fichajes={d['score_fichajes']}"
+            for d in diag
+        )
+        raise ValueError(
+            "No pude detectar automáticamente planilla base y fichajes. "
+            f"Diagnóstico: {detalle}"
+        )
+
     return planilla["path"], fichajes["path"], diag
 
 
@@ -1078,24 +943,10 @@ def procesar_archivos(archivo_planilla, archivo_fichajes, descargar_en_colab=Fal
                     ws.cell(fila, bloque[k]).value = None
 
     # Resúmenes de horas y nuevos estados.
-    resumen = actualizar_resumenes(ws, personas, bloques, anio, mes, feriados)
-
-    # Alertas recalculadas desde cero.
-    alertas = aplicar_alertas_visuales(
-        ws=ws,
-        personas=personas,
-        bloques=bloques,
-        cols=cols,
-        anio=anio,
-        mes=mes,
-        max_fecha=max_fecha,
-        cargados=cargados,
-        ignorados=ignorados,
-    )
+    actualizar_resumenes(ws, personas, bloques, anio, mes, feriados)
 
     agregar_hoja_control(wb, "VINCULOS_CARGADOS", cargados)
     agregar_hoja_control(wb, "IGNORADOS_FICHADOR", ignorados)
-    agregar_hoja_control(wb, "ALERTAS_PROCESO", alertas)
     agregar_hoja_control(wb, "DIAGNOSTICO", [{
         "PLANILLA": Path(archivo_planilla).name,
         "FICHAJES": Path(archivo_fichajes).name,
@@ -1105,8 +956,6 @@ def procesar_archivos(archivo_planilla, archivo_fichajes, descargar_en_colab=Fal
         "PERSONAS_PLANILLA": len(personas),
         "IDENTIDADES_VINCULADAS": len(cargados),
         "IDENTIDADES_IGNORADAS": len(ignorados),
-        "NOMBRES_RESALTADOS_ROJO": sum(1 for a in alertas if a.get("TIPO") == "AUSENCIAS"),
-        "LEGAJOS_RESALTADOS_AMARILLO": sum(1 for a in alertas if a.get("TIPO") == "REVISAR VÍNCULO"),
         "FERIADOS_DETECTADOS": "; ".join(f"{d.strftime('%d/%m/%Y')} {feriados[d]}" for d in sorted(feriados)),
     }])
 
@@ -1125,4 +974,3 @@ if __name__ == "__main__":
     print("Planilla:", planilla)
     print("Fichajes:", fichajes)
     print(procesar_archivos(planilla, fichajes, descargar_en_colab=False))
-
